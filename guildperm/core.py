@@ -1,7 +1,10 @@
 """公会权限：角色继承、否决优先、缓存失效。
 
-缺陷：只看成员的直接角色不看继承链、allow 会覆盖父角色的 deny、角色改动后缓存不失效、
-权限查询全扫所有角色、继承环不检测。
+规则：
+- 成员角色没有该规则时沿 ``parent`` 向上找，子角色的规则优先。
+- 链上任意角色显式 ``deny``（规则值为 ``False``）时结果必为否决。
+- ``set_role`` / ``add_role`` 后缓存整体失效。
+- ``add_role`` 形成继承环时抛 :class:`PermError`。
 """
 
 
@@ -19,25 +22,51 @@ class Guild:
         self.scanned = 0
 
     def add_role(self, name, parent=None, rules=None):
-        """加一个角色。缺陷：不检测继承环。"""
+        """加一个角色；若新边会形成继承环则抛 ``PermError``。"""
+        if parent is not None and self._would_cycle(name, parent):
+            raise PermError("继承环: %r -> %r" % (name, parent))
         self.roles[name] = {"parent": parent, "rules": dict(rules or {})}
         self.cache.clear()
 
     def set_role(self, member, role):
-        """给成员换角色。缺陷：忘了清缓存，旧权限还会生效。"""
+        """给成员换角色，并让旧判定缓存失效。"""
         self.members[member] = role
+        self.cache.clear()
+
+    def _would_cycle(self, name, parent):
+        """加入 ``name -> parent`` 这条边后是否成环（允许父角色尚未注册）。"""
+        current = parent
+        seen = set()
+        while current is not None:
+            if current == name or current in seen:
+                return True
+            seen.add(current)
+            node = self.roles.get(current)
+            current = node["parent"] if node is not None else None
+        return False
 
     def can(self, member, perm):
-        """权限判定。缺陷：只看直接角色、allow 覆盖 deny、每次全扫所有角色。"""
-        cached = self.cache.get((member, perm))
-        if cached is not None:
-            return cached
-        self.scanned += len(self.roles)
-        role = self.members.get(member)
+        """沿继承链判定；单次 O(链长)，结果缓存到下次变更前。"""
+        key = (member, perm)
+        if key in self.cache:
+            return self.cache[key]
         allowed = False
-        if role in self.roles and perm in self.roles[role]["rules"]:
-            allowed = self.roles[role]["rules"][perm]
-        self.cache[(member, perm)] = allowed
+        role = self.members.get(member)
+        seen = set()
+        while role is not None and role not in seen:
+            seen.add(role)
+            node = self.roles.get(role)
+            if node is None:
+                break
+            self.scanned += 1
+            rule = node["rules"].get(perm)
+            if rule is False:
+                allowed = False
+                break
+            if rule is True:
+                allowed = True
+            role = node["parent"]
+        self.cache[key] = allowed
         return allowed
 
     def scanned_count(self):
