@@ -1,7 +1,9 @@
 """公会权限：角色继承、否决优先、缓存失效。
 
-缺陷：只看成员的直接角色不看继承链、allow 会覆盖父角色的 deny、角色改动后缓存不失效、
-权限查询全扫所有角色、继承环不检测。
+判定沿成员角色的 ``parent`` 链进行：成员角色没有该规则时沿链向上找；链上
+任意角色显式 ``deny``（False）时结果即否决，任何 ``allow`` 都不许覆盖它。
+``set_role`` 与 ``add_role`` 都会让旧缓存失效；``add_role`` 发现继承环时
+抛 :class:`PermError`。``can`` 单次代价 O(链长)，不随角色总数线性增长。
 """
 
 
@@ -19,25 +21,46 @@ class Guild:
         self.scanned = 0
 
     def add_role(self, name, parent=None, rules=None):
-        """加一个角色。缺陷：不检测继承环。"""
+        """加一个角色；发现继承环时抛 PermError，并失效全部缓存。"""
+        node = parent
+        visited = set()
+        while node is not None and node not in visited:
+            if node == name:
+                raise PermError("角色继承存在环: %s" % name)
+            visited.add(node)
+            entry = self.roles.get(node)
+            node = entry["parent"] if entry is not None else None
         self.roles[name] = {"parent": parent, "rules": dict(rules or {})}
         self.cache.clear()
 
     def set_role(self, member, role):
-        """给成员换角色。缺陷：忘了清缓存，旧权限还会生效。"""
+        """给成员换角色，并失效全部缓存。"""
         self.members[member] = role
+        self.cache.clear()
 
     def can(self, member, perm):
-        """权限判定。缺陷：只看直接角色、allow 覆盖 deny、每次全扫所有角色。"""
-        cached = self.cache.get((member, perm))
+        """权限判定：沿继承链找规则，链上显式 deny 优先于任何 allow。"""
+        key = (member, perm)
+        cached = self.cache.get(key)
         if cached is not None:
             return cached
-        self.scanned += len(self.roles)
-        role = self.members.get(member)
         allowed = False
-        if role in self.roles and perm in self.roles[role]["rules"]:
-            allowed = self.roles[role]["rules"][perm]
-        self.cache[(member, perm)] = allowed
+        role = self.members.get(member)
+        visited = set()
+        while role is not None and role not in visited:
+            entry = self.roles.get(role)
+            if entry is None:
+                break
+            visited.add(role)
+            self.scanned += 1
+            value = entry["rules"].get(perm)
+            if value is not None:
+                if not value:
+                    allowed = False
+                    break
+                allowed = True
+            role = entry["parent"]
+        self.cache[key] = allowed
         return allowed
 
     def scanned_count(self):
